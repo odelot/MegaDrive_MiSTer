@@ -22,6 +22,8 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/md_io.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cartridge.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/md_plus.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mdp_audio.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ra_ram_mirror_md.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ddram_arb_md.sv
 set_global_assignment -name SYSTEMVERILOG_FILE hps_ext.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/saturn_keyboard.sv
 set_global_assignment -name SDC_FILE MegaDrive.sdc

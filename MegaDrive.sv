@@ -178,7 +178,7 @@ assign ADC_BUS  = 'Z;
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign BUTTONS   = osd_btn;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
-// DDRAM driven by mdp_audio for CDDA PCM streaming
+// DDRAM shared between mdp_audio (CDDA) and RetroAchievements mirror via arbiter
 
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
@@ -729,6 +729,34 @@ md_board md_board
 	.res_z80(res_z80)
 );
 
+// --- RetroAchievements RAM Mirror ---
+wire [14:0] ra_bram_addr;
+wire [15:0] ra_bram_dout;
+wire [31:0] ra_dbg_frame;
+
+ra_ram_mirror_md ra_mirror
+(
+	.clk(clk_md),
+	.reset(sys_reset),
+	.vblank(vblank_c),
+
+	.bram_addr(ra_bram_addr),
+	.bram_dout(ra_bram_dout),
+
+	.ddram_wr_addr(ra_ddram_wr_addr),
+	.ddram_wr_din(ra_ddram_wr_din),
+	.ddram_wr_be(ra_ddram_wr_be),
+	.ddram_wr_req(ra_ddram_wr_req),
+	.ddram_wr_ack(ra_ddram_wr_ack),
+	.ddram_rd_addr(ra_ddram_rd_addr),
+	.ddram_rd_req(ra_ddram_rd_req),
+	.ddram_rd_ack(ra_ddram_rd_ack),
+	.ddram_rd_dout(ra_ddram_rd_dout),
+
+	.active(ra_active),
+	.dbg_frame_counter(ra_dbg_frame)
+);
+
 dpram #(15,16) ram_68k
 (
 	.clock(clk_md),
@@ -739,8 +767,9 @@ dpram #(15,16) ram_68k
 	.byteena_a(ram_68k_byteena),
 	.q_a(ram_68k_o),
 
-	.address_b(ram_rst_a),
-	.wren_b(md_reset)
+	.address_b(md_reset ? ram_rst_a : ra_bram_addr),
+	.wren_b(md_reset),
+	.q_b(ra_bram_dout)
 );
 
 dpram #(13,8) ram_z80k
@@ -908,22 +937,85 @@ md_plus md_plus
 // CDDA audio output from mdp_audio
 wire signed [15:0] cdda_l, cdda_r;
 
+// --- DDRAM arbiter wires: mdp_audio (primary) + RA mirror (secondary) ---
+wire        mdp_ddram_clk;
+wire        mdp_ddram_busy;
+wire  [7:0] mdp_ddram_burstcnt;
+wire [28:0] mdp_ddram_addr;
+wire [63:0] mdp_ddram_dout;
+wire        mdp_ddram_dout_ready;
+wire        mdp_ddram_rd;
+wire [63:0] mdp_ddram_din;
+wire  [7:0] mdp_ddram_be;
+wire        mdp_ddram_we;
+
+wire [28:0] ra_ddram_wr_addr;
+wire [63:0] ra_ddram_wr_din;
+wire  [7:0] ra_ddram_wr_be;
+wire        ra_ddram_wr_req;
+wire        ra_ddram_wr_ack;
+wire [28:0] ra_ddram_rd_addr;
+wire        ra_ddram_rd_req;
+wire        ra_ddram_rd_ack;
+wire [63:0] ra_ddram_rd_dout;
+wire        ra_active;
+
+assign DDRAM_CLK = mdp_ddram_clk;
+
+ddram_arb_md ddram_arb
+(
+	.clk(clk_sys),
+
+	// Physical DDRAM
+	.PHY_BUSY(DDRAM_BUSY),
+	.PHY_BURSTCNT(DDRAM_BURSTCNT),
+	.PHY_ADDR(DDRAM_ADDR),
+	.PHY_DOUT(DDRAM_DOUT),
+	.PHY_DOUT_READY(DDRAM_DOUT_READY),
+	.PHY_RD(DDRAM_RD),
+	.PHY_DIN(DDRAM_DIN),
+	.PHY_BE(DDRAM_BE),
+	.PHY_WE(DDRAM_WE),
+
+	// mdp_audio (primary master)
+	.MDP_BUSY(mdp_ddram_busy),
+	.MDP_BURSTCNT(mdp_ddram_burstcnt),
+	.MDP_ADDR(mdp_ddram_addr),
+	.MDP_DOUT(mdp_ddram_dout),
+	.MDP_DOUT_READY(mdp_ddram_dout_ready),
+	.MDP_RD(mdp_ddram_rd),
+	.MDP_DIN(mdp_ddram_din),
+	.MDP_BE(mdp_ddram_be),
+	.MDP_WE(mdp_ddram_we),
+
+	// RA mirror (secondary, toggle protocol)
+	.ra_wr_addr(ra_ddram_wr_addr),
+	.ra_wr_din(ra_ddram_wr_din),
+	.ra_wr_be(ra_ddram_wr_be),
+	.ra_wr_req(ra_ddram_wr_req),
+	.ra_wr_ack(ra_ddram_wr_ack),
+	.ra_rd_addr(ra_ddram_rd_addr),
+	.ra_rd_req(ra_ddram_rd_req),
+	.ra_rd_ack(ra_ddram_rd_ack),
+	.ra_rd_dout(ra_ddram_rd_dout)
+);
+
 mdp_audio mdp_audio
 (
 	.clk(clk_sys),
 	.reset(sys_reset),
 
-	// DDRAM interface
-	.DDRAM_CLK(DDRAM_CLK),
-	.DDRAM_BUSY(DDRAM_BUSY),
-	.DDRAM_BURSTCNT(DDRAM_BURSTCNT),
-	.DDRAM_ADDR(DDRAM_ADDR),
-	.DDRAM_DOUT(DDRAM_DOUT),
-	.DDRAM_DOUT_READY(DDRAM_DOUT_READY),
-	.DDRAM_RD(DDRAM_RD),
-	.DDRAM_DIN(DDRAM_DIN),
-	.DDRAM_BE(DDRAM_BE),
-	.DDRAM_WE(DDRAM_WE),
+	// DDRAM interface (through arbiter)
+	.DDRAM_CLK(mdp_ddram_clk),
+	.DDRAM_BUSY(mdp_ddram_busy),
+	.DDRAM_BURSTCNT(mdp_ddram_burstcnt),
+	.DDRAM_ADDR(mdp_ddram_addr),
+	.DDRAM_DOUT(mdp_ddram_dout),
+	.DDRAM_DOUT_READY(mdp_ddram_dout_ready),
+	.DDRAM_RD(mdp_ddram_rd),
+	.DDRAM_DIN(mdp_ddram_din),
+	.DDRAM_BE(mdp_ddram_be),
+	.DDRAM_WE(mdp_ddram_we),
 
 	// Ring buffer pointers (from/to hps_ext)
 	.active(mdp_audio_active),
