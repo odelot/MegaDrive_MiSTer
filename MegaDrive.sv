@@ -237,7 +237,7 @@ localparam CONF_STR = {
 	"d7O[12],TMSS,Disabled,Enabled;",
 	
 	"-;",
-	"C,Cheats;",
+	"H1C,Cheats;",
 	"H1O[24],Cheats Enabled,Yes,No;",
 	"-;",
 	"O[13],Autosave,Off,On;",
@@ -281,6 +281,7 @@ localparam CONF_STR = {
 
 	"-;",
 	"O[61],Pause When OSD is Open,No,Yes;",
+	"-;",
 	"R[0],Reset;",
 	"J1,A,B,C,Start,Mode,X,Y,Z;",
 	"jn,A,B,R,Start,Select,X,Y,L;", // name map to SNES layout.
@@ -368,6 +369,7 @@ assign CLK_VIDEO = clk_107m;
 ///////////////////////////////////////////////////
 
 wire[127:0] status;
+wire hardcore = status[64];
 wire  [1:0] buttons;
 wire [11:0] joystick_0,joystick_1,joystick_2,joystick_3,joystick_4;
 wire  [7:0] joy0_x,joy0_y,joy1_x,joy1_y;
@@ -421,7 +423,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.status(status),
 	.status_in({status[127:8],region_req,status[5:0]}),
 	.status_set(region_set),
-	.status_menumask({tmss_loaded,status[13],en216p,!gun_mode,1'b0,status[8],~gg_available,~bk_ena}),
+	.status_menumask({tmss_loaded,status[13],en216p,!gun_mode,1'b0,status[8],(~gg_available | hardcore),~bk_ena}),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
@@ -1547,7 +1549,7 @@ CODES #(.ADDR_WIDTH(24), .DATA_WIDTH(16), .BIG_ENDIAN(1)) codes_68k
 (
 	.clk(clk_sys),
 	.reset(cart_download | (code_download && ioctl_wr && !ioctl_addr)),
-	.enable(~status[24] & ~cart_ms),
+	.enable(~status[24] & ~cart_ms & ~hardcore),
 	.code(gg_code),
 	.available(gg_available),
 	.addr_in({m68k_addr, 1'b0}),
@@ -1563,7 +1565,7 @@ CODES #(.ADDR_WIDTH(16), .DATA_WIDTH(8)) codes_z80
 (
 	.clk(clk_sys),
 	.reset(cart_download | (code_download && ioctl_wr && !ioctl_addr)),
-	.enable(~status[24] & cart_ms),
+	.enable(~status[24] & cart_ms & ~hardcore),
 	.code(gg_code),
 	.addr_in(z80_addr),
 	.data_in(z80_bus_do),
