@@ -173,6 +173,14 @@ reg  [2:0] qry_byte_idx;
 reg  [10:0] qry_poll_timer;
 reg        rtquery_armed = 1'b0;  // set by ARM via RA_ARM_CFG_RTQUERY bit
 
+// Next byte address of a multi-byte query. Derive the BRAM word address from
+// the incremented address itself: the previous form XORed bits 15/14 with
+// qry_addr[0], which flips the word address by 0x2000/0x4000 whenever the
+// query started on an odd address (the carry out of qry_addr[13:1] was also
+// dropped), so the high byte of a 16/32-bit read at an odd address came from
+// a word ~16KB away.
+wire [31:0] qry_addr_next = qry_addr + 32'd1;
+
 // DDRAM wait timeout
 reg [19:0] ddram_wait_timeout;
 
@@ -570,8 +578,8 @@ always @(posedge clk) begin
 			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
 				state <= S_QRY_WR_RESP;
 			end else begin
-				qry_addr  <= qry_addr + 32'd1;
-				bram_addr <= {(qry_addr[15] ^ qry_addr[0]), ~(qry_addr[14] ^ qry_addr[0]), qry_addr[13:1] + {12'd0, qry_addr[0]}};
+				qry_addr  <= qry_addr_next;
+				bram_addr <= {qry_addr_next[15], ~qry_addr_next[14], qry_addr_next[13:1]};
 				state     <= S_QRY_BRAM_W1;
 			end
 		end
