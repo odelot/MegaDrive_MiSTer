@@ -237,7 +237,10 @@ localparam CONF_STR = {
 	"d7O[12],TMSS,Disabled,Enabled;",
 	
 	"-;",
-	"H1C,Cheats;",
+	// H3 = hardcore only. Do NOT use H1 here: bit 1 includes ~gg_available,
+	// which stays 1 until a code is loaded, and codes are only loaded from
+	// this very menu -> the Cheats page would never appear.
+	"H3C,Cheats;",
 	"H1O[24],Cheats Enabled,Yes,No;",
 	"-;",
 	"O[13],Autosave,Off,On;",
@@ -423,7 +426,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.status(status),
 	.status_in({status[127:8],region_req,status[5:0]}),
 	.status_set(region_set),
-	.status_menumask({tmss_loaded,status[13],en216p,!gun_mode,1'b0,status[8],(~gg_available | hardcore),~bk_ena}),
+	.status_menumask({tmss_loaded,status[13],en216p,!gun_mode,hardcore,status[8],(~gg_available | hardcore),~bk_ena}),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
@@ -732,18 +735,26 @@ md_board md_board
 );
 
 // --- RetroAchievements RAM Mirror ---
+reg         bk_state = 0;    // declared here: the mirror below gates on it
 wire [14:0] ra_bram_addr;
 wire [15:0] ra_bram_dout;
+wire [15:0] ra_sram_addr;
+wire        ra_sram_req;
+wire  [7:0] ra_sram_dout;
 wire [31:0] ra_dbg_frame;
 
 ra_ram_mirror_md ra_mirror
 (
 	.clk(clk_md),
 	.reset(sys_reset),
-	.vblank(vblank_c),
+	.vblank(vblank_c & ~bk_state),
 
 	.bram_addr(ra_bram_addr),
 	.bram_dout(ra_bram_dout),
+
+	.sram_addr(ra_sram_addr),
+	.sram_req(ra_sram_req),
+	.sram_dout(ra_sram_dout),
 
 	.ddram_wr_addr(ra_ddram_wr_addr),
 	.ddram_wr_din(ra_ddram_wr_din),
@@ -849,6 +860,10 @@ cartridge cartridge
 	.cart_time(cart_time),
 	.cart_dtack(cart_dtack_rom),
 	.cart_dma(cart_dma),
+
+	.ra_sram_addr(ra_sram_addr),
+	.ra_sram_req(ra_sram_req & ~bk_state),
+	.ra_sram_dout(ra_sram_dout),
 
 	.save_addr({sd_lba[6:0],sd_buff_addr}),
 	.save_di(sd_buff_dout),
@@ -1466,7 +1481,6 @@ end
 wire bk_load    = status[16];
 wire bk_save    = status[17] | (sav_pending & OSD_STATUS & status[13]);
 reg  bk_loading = 0;
-reg  bk_state   = 0;
 
 always @(posedge clk_sys) begin
 	reg old_downloading = 0;
