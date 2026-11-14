@@ -55,6 +55,11 @@ module cartridge
 	output            cart_dtack,
 	input             cart_dma,
 
+	// RetroAchievements SRAM read port (port B, yields to save I/O)
+	input      [15:0] ra_sram_addr,
+	input             ra_sram_req,
+	output      [7:0] ra_sram_dout,
+
 	input      [14:0] save_addr,
 	input      [15:0] save_di,
 	output     [15:0] save_do,
@@ -243,6 +248,16 @@ wire [15:0] sram2_di;
 wire [15:0] sram2_q;
 wire        sram2_wren;
 
+// RetroAchievements save-RAM view. Two different layouts live in this dpram
+// and they need different index maths (see ra_sram_dout below for the full
+// derivation):
+//   linear    - EEPROM carts (I2C via eeprom_ram_a, m95 SPI via m95_addr) and
+//               Master System carts. Byte index == RA offset.
+//   compacted - parallel MD SRAM. Byte index == RA offset >> 1.
+wire        ra_sram_linear  = cart_ms | pier_quirk | (|eeprom_quirk);
+wire [15:0] ra_sram_pb_addr = ra_sram_linear ? {1'b0,  ra_sram_addr[15:1]}
+                                             : {2'b00, ra_sram_addr[15:2]};
+
 always_comb begin
 	if(cart_dl) begin
 		sram2_addr = ram_rst_a;
@@ -253,6 +268,11 @@ always_comb begin
 		sram2_addr = svp_dram_a;
 		sram2_di   = svp_dram_do;
 		sram2_wren = svp_dram_we;
+	end
+	else if(ra_sram_req) begin
+		sram2_addr = ra_sram_pb_addr;
+		sram2_di   = 16'h0000;
+		sram2_wren = 0;
 	end
 	else begin
 		sram2_addr = save_addr;
@@ -277,6 +297,34 @@ dpram_dif #(17,8,16,16) ram
 
 assign save_do     = sram2_q;
 assign save_change = sram_wren;
+
+// RetroAchievements SRAM read. rcheevos maps MegaDrive "Cartridge RAM" to
+// $10000-$1FFFF; Genesis Plus GX backs that region with sram.sram, a flat byte
+// array indexed by the raw 68K address (sram_read_byte does sram.sram[addr &
+// 0xffff] -- no READ_BYTE, so unlike work_ram it is NOT byte-swapped). So RA
+// offset n is 68K $200000+n.
+//
+// Parallel SRAM: this core stores it compacted, one byte per 68K word at
+// port-A index A[16:1], and only ever writes it on cart_lwr (odd 68K
+// addresses). Even offsets therefore hold no data here and none in the
+// emulator either, where they keep the power-on fill -- 0xFF, or 0x00 for the
+// carts sram00_quirk covers, matching Genesis Plus GX's own sram_init.
+//
+// EEPROM carts are NOT compacted. Genesis Plus GX indexes sram.sram by the
+// EEPROM's own word address (eeprom_i2c.c: sram.sram[(device|word) & 0xffff],
+// eeprom_spi.c: sram.sram[spi_eeprom.addr]) and this core drives port A from
+// eeprom_ram_a / m95_addr, the very same linear index. Every byte is real
+// data there, so no odd/even fill applies. Master System carts are linear too.
+wire [7:0] ra_sram_fill = sram00_quirk ? 8'h00 : 8'hFF;
+wire [7:0] ra_sram_lin  = ra_sram_addr[0] ? sram2_q[15:8] : sram2_q[7:0];
+wire [7:0] ra_sram_cmp  = ~ra_sram_addr[0] ? ra_sram_fill
+                        : (ra_sram_addr[1] ? sram2_q[15:8] : sram2_q[7:0]);
+
+// SVP carts (Virtua Racing) keep port B for the SVP's own DRAM, so the mux
+// above never hands it to RA and sram2_q holds SVP traffic. Genesis Plus GX
+// reports no save RAM for them (sram.on = 0), so 0 is the honest answer.
+assign ra_sram_dout = svp_quirk ? 8'h00
+                    : (ra_sram_linear ? ra_sram_lin : ra_sram_cmp);
 
 //---------------------- MD cart ---------------------------------------
 

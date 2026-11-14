@@ -5,7 +5,8 @@
 //
 // MegaDrive memory map for rcheevos:
 //   0x00000–0x0FFFF : 68K Work RAM (64KB, mapped to BRAM)
-//   0x10000+        : returns 0 (SRAM not yet supported)
+//   0x10000–0x1FFFF : Cartridge RAM (SRAM, port B of the cart dpram)
+//   0x20000+        : returns 0
 //
 // DDRAM Layout (at DDRAM_BASE, ARM phys 0x3D000000):
 //   [0x00000] Header:   magic(32) + 0(8) + flags(8) + 0(16)
@@ -28,6 +29,11 @@ module ra_ram_mirror_md #(
 	// 68K Work RAM BRAM read interface (directly to dpram port B)
 	output reg [14:0] bram_addr,     // 15-bit = 32K words (64KB)
 	input      [15:0] bram_dout,     // 16-bit word from BRAM
+
+	// Cartridge SRAM read interface (offset within the 0x10000 region)
+	output reg [15:0] sram_addr,
+	output reg        sram_req,
+	input       [7:0] sram_dout,
 
 	// DDRAM write interface (toggle req/ack)
 	output reg [28:0] ddram_wr_addr,
@@ -53,14 +59,22 @@ module ra_ram_mirror_md #(
 localparam [28:0] ADDRLIST_BASE = DDRAM_BASE + 29'h8000;  // byte offset 0x40000 / 8
 localparam [28:0] VALCACHE_BASE = DDRAM_BASE + 29'h9000;  // byte offset 0x48000 / 8
 localparam [31:0] WRAM_LIMIT    = 32'h10000;              // 64KB boundary
+localparam [31:0] SRAM_LIMIT    = 32'h20000;              // end of Cartridge RAM
 localparam [12:0] MAX_ADDRS     = 13'd4096;
+
+// Version published in the DDRAM header (major<<8 | minor). Main surfaces it
+// as "FPGA core version" in the log and in the RA User-Agent.
+//   major 2 = Selective Address + RTQuery
+//   minor   = build revision — BUMP ON EVERY SYNTHESIS, so a log always says
+//             which bitstream produced it.
+localparam [15:0] CORE_VERSION  = 16'h0202;   // 2.2 — Cartridge RAM (0x10000-0x1FFFF) mapped
 
 // Realtime query mailbox (Tier 1 smart cache)
 localparam [28:0] QUERY_CTRL_ADDR = DDRAM_BASE + 29'hA000;  // byte offset 0x50000 / 8
 localparam [28:0] QUERY_REQ_BASE  = DDRAM_BASE + 29'hA001;  // byte offset 0x50008 / 8
 localparam [28:0] QUERY_RESP_BASE = DDRAM_BASE + 29'hA011;  // byte offset 0x50088 / 8
 localparam [28:0] ARM_CFG_ADDR    = DDRAM_BASE + 29'd8;        // byte offset 0x40: ARM-written config
-localparam [3:0]  MAX_RT_QUERIES  = 4'd16;
+localparam [7:0]  MAX_RT_QUERIES  = 8'd16;   // was [3:0]=4'd16 -> truncated to 0
 
 // ======================================================================
 // Clock domain crossing synchronizers for DDRAM ack (running on clk_sys)
@@ -129,6 +143,11 @@ localparam S_QRY_WR_RESP = 6'd31;
 localparam S_QRY_WR_CTRL = 6'd32;
 localparam S_RD_ARMCFG    = 6'd33;  // initiate read of ARM config word
 localparam S_PARSE_ARMCFG = 6'd34;  // latch rtquery_armed from rd_data[0]
+localparam S_FETCH_SRAM   = 6'd35;  // present cart SRAM address
+localparam S_SRAM_W1      = 6'd36;  // BRAM latency cycle 1
+localparam S_SRAM_W2      = 6'd37;  // BRAM latency cycle 2 + capture
+localparam S_QRY_SRAM_W1  = 6'd38;
+localparam S_QRY_SRAM_W2  = 6'd39;
 
 reg [5:0]  state;
 reg [5:0]  return_state;
@@ -165,7 +184,7 @@ reg [15:0] dbg_sweep_dout2;  // BRAM result for FF84 (bram_addr 0x5FC2)
 reg  [7:0] qry_request_seq;
 reg  [7:0] qry_last_seen_seq;
 reg  [7:0] qry_num;
-reg  [3:0] qry_idx;
+reg  [4:0] qry_idx;   // 0..16: needs 5 bits to reach the batch cap
 reg [31:0] qry_addr;
 reg  [7:0] qry_num_bytes;
 reg [31:0] qry_value;
@@ -196,6 +215,7 @@ always @(posedge clk) begin
 		ddram_rd_req <= drd_ack_s2;
 		qry_last_seen_seq <= 8'd0;
 		qry_poll_timer <= 11'd0;
+		sram_req     <= 1'b0;
 	end
 	else begin
 		case (state)
@@ -216,7 +236,7 @@ always @(posedge clk) begin
 				dbg_sweep_dout2 <= 16'd0;
 				// Write header with busy=1
 				ddram_wr_addr <= DDRAM_BASE;
-				ddram_wr_din  <= {16'h0200, 8'h01, 8'd0, 32'h52414348};
+				ddram_wr_din  <= {CORE_VERSION, 8'h01, 8'd0, 32'h52414348};
 				ddram_wr_be   <= 8'hFF;
 				ddram_wr_req  <= ~ddram_wr_req;
 				return_state  <= S_READ_HDR;
@@ -316,11 +336,33 @@ always @(posedge clk) begin
 				dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
 				state      <= S_BRAM_WAIT;
 			end
+			else if (cur_addr < SRAM_LIMIT) begin
+				dbg_ok_cnt <= dbg_ok_cnt + 16'd1;
+				state      <= S_FETCH_SRAM;
+			end
 			else begin
 				fetch_byte <= 8'd0;
 				dbg_oob_cnt <= dbg_oob_cnt + 16'd1;
 				state      <= S_STORE_VAL;
 			end
+		end
+
+		// Cart SRAM lives on the shared dpram port B; the byte/fill selection
+		// happens in cartridge.sv, this just presents the offset.
+		S_FETCH_SRAM: begin
+			sram_addr <= cur_addr[15:0];
+			sram_req  <= 1'b1;
+			state     <= S_SRAM_W1;
+		end
+
+		S_SRAM_W1: begin
+			state <= S_SRAM_W2;
+		end
+
+		S_SRAM_W2: begin
+			fetch_byte <= sram_dout;
+			sram_req   <= 1'b0;
+			state      <= S_STORE_VAL;
 		end
 
 		S_BRAM_WAIT: begin
@@ -404,7 +446,7 @@ always @(posedge clk) begin
 
 		S_WR_HDR0: begin
 			ddram_wr_addr <= DDRAM_BASE;
-			ddram_wr_din  <= {16'h0200, 8'h00, 8'd0, 32'h52414348};
+			ddram_wr_din  <= {CORE_VERSION, 8'h00, 8'd0, 32'h52414348};
 			ddram_wr_be   <= 8'hFF;
 			ddram_wr_req  <= ~ddram_wr_req;
 			return_state  <= S_WR_HDR1;
@@ -533,9 +575,9 @@ always @(posedge clk) begin
 		S_QRY_PARSE: begin
 			if (rd_data[7:0] != qry_last_seen_seq && rd_data[15:8] != 8'd0) begin
 				qry_request_seq <= rd_data[7:0];
-				qry_num         <= (rd_data[15:8] > {4'd0, MAX_RT_QUERIES}) ?
-				                   {4'd0, MAX_RT_QUERIES} : rd_data[15:8];
-				qry_idx         <= 4'd0;
+				qry_num         <= (rd_data[15:8] > MAX_RT_QUERIES) ?
+				                   MAX_RT_QUERIES : rd_data[15:8];
+				qry_idx         <= 5'd0;
 				state           <= S_QRY_RD_REQ;
 			end else begin
 				state <= S_IDLE;
@@ -543,7 +585,7 @@ always @(posedge clk) begin
 		end
 
 		S_QRY_RD_REQ: begin
-			ddram_rd_addr <= QUERY_REQ_BASE + {25'd0, qry_idx};
+			ddram_rd_addr <= QUERY_REQ_BASE + {25'd0, qry_idx[3:0]};
 			ddram_rd_req  <= ~ddram_rd_req;
 			return_state  <= S_QRY_FETCH;
 			state         <= S_DD_RD_WAIT;
@@ -558,6 +600,10 @@ always @(posedge clk) begin
 				// FC1004 bit-13 inversion for BRAM address
 				bram_addr <= {rd_data[15], ~rd_data[14], rd_data[13:1]};
 				state     <= S_QRY_BRAM_W1;
+			end else if (rd_data[31:0] < SRAM_LIMIT) begin
+				sram_addr <= rd_data[15:0];
+				sram_req  <= 1'b1;
+				state     <= S_QRY_SRAM_W1;
 			end else begin
 				// Out of range: return 0
 				state <= S_QRY_WR_RESP;
@@ -577,20 +623,46 @@ always @(posedge clk) begin
 			qry_byte_idx <= qry_byte_idx + 3'd1;
 			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
 				state <= S_QRY_WR_RESP;
-			end else begin
+			end else if (qry_addr_next < WRAM_LIMIT) begin
 				qry_addr  <= qry_addr_next;
 				bram_addr <= {qry_addr_next[15], ~qry_addr_next[14], qry_addr_next[13:1]};
 				state     <= S_QRY_BRAM_W1;
+			end else begin
+				// Would leave Work RAM; remaining bytes stay 0 rather than
+				// wrapping back to the start of the region.
+				state <= S_QRY_WR_RESP;
+			end
+		end
+
+		S_QRY_SRAM_W1: begin
+			state <= S_QRY_SRAM_W2;
+		end
+
+		S_QRY_SRAM_W2: begin
+			qry_value    <= qry_value | ({24'd0, sram_dout} << (qry_byte_idx * 8));
+			qry_byte_idx <= qry_byte_idx + 3'd1;
+			if (qry_byte_idx + 3'd1 >= qry_num_bytes[2:0]) begin
+				sram_req <= 1'b0;
+				state    <= S_QRY_WR_RESP;
+			end else if (qry_addr_next < SRAM_LIMIT) begin
+				qry_addr  <= qry_addr_next;
+				sram_addr <= qry_addr_next[15:0];
+				state     <= S_QRY_SRAM_W1;
+			end else begin
+				// Would leave Cartridge RAM; qry_addr_next[15:0] would wrap
+				// to offset 0 and read the start of the save.
+				sram_req <= 1'b0;
+				state    <= S_QRY_WR_RESP;
 			end
 		end
 
 		S_QRY_WR_RESP: begin
-			ddram_wr_addr <= QUERY_RESP_BASE + {25'd0, qry_idx};
+			ddram_wr_addr <= QUERY_RESP_BASE + {25'd0, qry_idx[3:0]};
 			ddram_wr_din  <= {32'd0, qry_value};
 			ddram_wr_be   <= 8'hFF;
 			ddram_wr_req  <= ~ddram_wr_req;
-			qry_idx       <= qry_idx + 4'd1;
-			if (qry_idx + 4'd1 >= qry_num[3:0]) begin
+			qry_idx       <= qry_idx + 5'd1;
+			if (qry_idx + 5'd1 >= {1'b0, qry_num[7:0]}) begin
 				return_state <= S_QRY_WR_CTRL;
 			end else begin
 				return_state <= S_QRY_RD_REQ;
